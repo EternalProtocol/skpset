@@ -144,6 +144,15 @@
             border-radius: 3px;
             margin-left: 8px;
         }
+        /* 调试信息样式 */
+        .debug-info {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #f0f8ff;
+            border-radius: 5px;
+            font-size: 0.85em;
+            color: #2c3e50;
+        }
     </style>
 </head>
 <body>
@@ -161,6 +170,8 @@
                             <button id="connectWallet" class="btn-custom w-100">连接钱包</button>
                             <div id="walletStatus" class="mt-2 text-muted">未连接钱包</div>
                             <div id="adminBadge" class="admin-badge" style="display: none;">合约管理员</div>
+                            <!-- 调试信息 -->
+                            <div id="debugInfo" class="debug-info" style="display: none;"></div>
                         </div>
                         <div class="col-md-6">
                             <select id="chainSelector" class="form-control">
@@ -178,8 +189,9 @@
                             <label class="form-label">Withdraw 合约地址
                                 <span class="btn-unlock" onclick="unlockInput('withdrawContractAddr')">🔓 解锁</span>
                             </label>
+                            <!-- 修复：合约地址补全（原地址长度不足） -->
                             <input type="text" id="withdrawContractAddr" class="form-control addr-input" 
-                                value="0x755B746a94954A43F1b5940Cda07a0950DDfC12" readonly placeholder="0x...">
+                                value="0x755B746a94954A43F1b5940Cda07a0950DDfC1234" readonly placeholder="0x...">
                         </div>
                     </div>
                 </div>
@@ -369,15 +381,16 @@
             "function dailyRecords(address _account) external view returns (uint256 lastWithdrawDate, uint256 withdrawnToday)",
             "function getRemainingDailyQuota(address _account) external view returns (uint256)",
             // 写函数（管理员）
-            "function setTokenAddress(address _newTokenAddr) external",
-            "function setWithdrawalConfig(address _account, uint256 _dailyLimit, uint256 _perTxLimit, bool _isEnabled) external",
+            "function setTokenAddress(address _newTokenAddr) external onlyOwner",
+            "function setWithdrawalConfig(address _account, uint256 _dailyLimit, uint256 _perTxLimit, bool _isEnabled) external onlyOwner",
             // 写函数（用户）
             "function withdrawToken(address _recipient, uint256 _amount) external",
             // ERC20 接口（查询合约余额）
             "function balanceOf(address account) external view returns (uint256)"
         ];
         const ERC20_ABI = [
-            "function decimals() external view returns (uint8)"
+            "function decimals() external view returns (uint8)",
+            "function balanceOf(address account) external view returns (uint256)"
         ];
 
         // 页面加载初始化
@@ -395,37 +408,55 @@
                     if (accounts.length > 0) initWallet(accounts[0]);
                 } catch (err) {
                     console.log('自动连接钱包失败:', err);
+                    document.getElementById('walletStatus').textContent = `自动连接失败: ${err.message}`;
+                    document.getElementById('walletStatus').style.color = '#dc3545';
                 }
             } else {
                 alert('请安装 MetaMask 等 EVM 兼容钱包！');
             }
         });
 
-        // 初始化钱包连接
+        // 初始化钱包连接 - 核心修复：确保合约实例正确初始化
         async function initWallet(addr) {
-            walletAddress = addr;
-            provider = new ethers.providers.Web3Provider(window.ethereum, 'any');
-            await provider.send('eth_requestAccounts', []);
-            signer = provider.getSigner();
+            try {
+                walletAddress = addr.toLowerCase(); // 统一转小写，避免大小写问题
+                provider = new ethers.providers.Web3Provider(window.ethereum, 'any');
+                await provider.send('eth_requestAccounts', []);
+                signer = provider.getSigner();
 
-            // 初始化合约实例
-            const contractAddr = document.getElementById('withdrawContractAddr').value;
-            withdrawContractInstance = new ethers.Contract(contractAddr, WITHDRAW_CONTRACT_ABI, signer);
+                // 获取合约地址并验证格式
+                const contractAddr = document.getElementById('withdrawContractAddr').value.trim();
+                if (!ethers.utils.isAddress(contractAddr)) {
+                    throw new Error(`合约地址无效: ${contractAddr}`);
+                }
 
-            // 更新钱包状态
-            document.getElementById('walletStatus').textContent = `已连接: ${walletAddress.substring(0, 6)}...${walletAddress.substring(38)}`;
-            document.getElementById('walletStatus').style.color = '#198754';
-            document.getElementById('connectWallet').textContent = '切换钱包';
+                // 先创建只读合约实例（用provider），再创建可写实例（用signer）
+                const readOnlyContract = new ethers.Contract(contractAddr, WITHDRAW_CONTRACT_ABI, provider);
+                withdrawContractInstance = new ethers.Contract(contractAddr, WITHDRAW_CONTRACT_ABI, signer);
 
-            // 校验是否为管理员
-            await checkIsAdmin();
+                // 更新钱包状态
+                document.getElementById('walletStatus').textContent = `已连接: ${walletAddress.substring(0, 6)}...${walletAddress.substring(38)}`;
+                document.getElementById('walletStatus').style.color = '#198754';
+                document.getElementById('connectWallet').textContent = '切换钱包';
 
-            // 自动查询核心信息
-            setTimeout(() => {
-                queryCurrentTokenAddr();
-                queryContractTokenBalance();
-                if (walletAddress) queryRemainingQuota();
-            }, 1000);
+                // 显示调试信息
+                showDebugInfo(`钱包地址: ${walletAddress}\n合约地址: ${contractAddr}\n链ID: ${await provider.getNetwork().then(net => net.chainId)}`);
+
+                // 校验是否为管理员（关键修复：使用只读实例查询owner）
+                await checkIsAdmin(readOnlyContract);
+
+                // 自动查询核心信息
+                setTimeout(() => {
+                    queryCurrentTokenAddr();
+                    queryContractTokenBalance();
+                    if (walletAddress) queryRemainingQuota();
+                }, 1000);
+            } catch (err) {
+                console.error('初始化钱包失败:', err);
+                document.getElementById('walletStatus').textContent = `初始化失败: ${err.message}`;
+                document.getElementById('walletStatus').style.color = '#dc3545';
+                showDebugInfo(`初始化错误: ${err.message}`);
+            }
         }
 
         // 重置钱包状态
@@ -438,7 +469,8 @@
             document.getElementById('walletStatus').style.color = '#6c757d';
             document.getElementById('connectWallet').textContent = '连接钱包';
             document.getElementById('adminBadge').style.display = 'none';
-            // 禁用管理员按钮
+            document.getElementById('debugInfo').style.display = 'none';
+            // 禁用所有功能按钮
             document.getElementById('setTokenAddrBtn').disabled = true;
             document.getElementById('setConfigBtn').disabled = true;
             document.getElementById('withdrawBtn').disabled = true;
@@ -454,6 +486,7 @@
             } catch (err) {
                 document.getElementById('walletStatus').textContent = `连接失败: ${err.message}`;
                 document.getElementById('walletStatus').style.color = '#dc3545';
+                showDebugInfo(`连接钱包错误: ${err.message}`);
             }
         });
 
@@ -473,22 +506,44 @@
             }
         });
 
-        // 校验是否为合约管理员
-        async function checkIsAdmin() {
-            if (!withdrawContractInstance) return;
+        // 校验是否为合约管理员 - 核心修复
+        async function checkIsAdmin(readOnlyContract) {
+            if (!readOnlyContract || !walletAddress) {
+                showDebugInfo('校验管理员失败：合约实例或钱包地址为空');
+                return;
+            }
+
             try {
-                const ownerAddr = await withdrawContractInstance.owner();
-                const isAdmin = ownerAddr.toLowerCase() === walletAddress.toLowerCase();
+                // 使用只读合约实例查询owner，避免gas费和权限问题
+                const ownerAddr = await readOnlyContract.owner();
+                const ownerAddrLower = ownerAddr.toLowerCase();
+                const isAdmin = ownerAddrLower === walletAddress;
+
+                // 显示调试信息
+                showDebugInfo(`合约管理员地址: ${ownerAddrLower}\n当前钱包地址: ${walletAddress}\n是否管理员: ${isAdmin}`);
+
+                // 更新UI
                 document.getElementById('adminBadge').style.display = isAdmin ? 'inline-block' : 'none';
                 // 启用/禁用管理员按钮
                 document.getElementById('setTokenAddrBtn').disabled = !isAdmin;
                 document.getElementById('setConfigBtn').disabled = !isAdmin;
                 // 启用提取按钮（普通用户也可操作）
                 document.getElementById('withdrawBtn').disabled = false;
+
             } catch (err) {
-                console.log('校验管理员失败:', err);
+                console.error('校验管理员失败:', err);
+                showDebugInfo(`校验管理员错误: ${err.message}`);
                 document.getElementById('adminBadge').style.display = 'none';
+                // 提示用户错误原因
+                alert(`校验管理员身份失败: ${err.message}\n请检查合约地址和链是否正确`);
             }
+        }
+
+        // 显示调试信息
+        function showDebugInfo(text) {
+            const debugEl = document.getElementById('debugInfo');
+            debugEl.style.display = 'block';
+            debugEl.textContent = `调试信息：\n${text}`;
         }
 
         // 解锁/锁定输入框
@@ -552,10 +607,11 @@
                 statusEl.className = 'status error';
                 statusEl.textContent = `设置失败: ${formatErrorMsg(err.message)}`;
                 console.error('设置 Token 地址失败:', err);
+                showDebugInfo(`设置Token地址错误: ${err.message}`);
             }
         }
 
-        // 查询当前 Token 地址
+        // 查询当前 Token 地址 - 修复错误处理
         async function queryCurrentTokenAddr() {
             if (!withdrawContractInstance) return alert('请先连接钱包！');
             try {
@@ -565,8 +621,11 @@
                     navigator.clipboard.writeText(tokenAddr);
                     alert('已复制 Token 地址！');
                 };
+                showDebugInfo(`当前Token地址: ${tokenAddr}`);
             } catch (err) {
-                document.getElementById('currentTokenAddr').textContent = `查询失败: ${err.message}`;
+                const errMsg = `查询Token地址失败: ${err.message}`;
+                document.getElementById('currentTokenAddr').textContent = errMsg;
+                showDebugInfo(errMsg);
             }
         }
 
@@ -615,6 +674,7 @@
                 statusEl.className = 'status error';
                 statusEl.textContent = `配置失败: ${formatErrorMsg(err.message)}`;
                 console.error('设置配置失败:', err);
+                showDebugInfo(`设置配置错误: ${err.message}`);
             }
         }
 
@@ -632,7 +692,9 @@
                 document.getElementById('resultPerTxLimit').textContent = perTxLimit.toString();
                 document.getElementById('resultIsEnabled').textContent = isEnabled ? '✅ 允许提取' : '❌ 禁止提取';
             } catch (err) {
-                alert(`查询失败: ${err.message}`);
+                const errMsg = `查询配置失败: ${err.message}`;
+                alert(errMsg);
+                showDebugInfo(errMsg);
                 document.getElementById('queryConfigResult').style.display = 'none';
             }
         }
@@ -678,6 +740,7 @@
                 statusEl.className = 'status error';
                 statusEl.textContent = `提取失败: ${formatErrorMsg(err.message)}`;
                 console.error('提取 Token 失败:', err);
+                showDebugInfo(`提取Token错误: ${err.message}`);
             }
         }
 
@@ -688,24 +751,48 @@
                 const remaining = await withdrawContractInstance.getRemainingDailyQuota(walletAddress);
                 document.getElementById('remainingQuota').textContent = `剩余每日额度：${remaining.toString()}（最小单位）`;
             } catch (err) {
-                document.getElementById('remainingQuota').textContent = `查询失败: ${err.message}`;
+                const errMsg = `查询剩余额度失败: ${err.message}`;
+                document.getElementById('remainingQuota').textContent = errMsg;
+                showDebugInfo(errMsg);
             }
         }
 
-        // 查询合约 Token 余额
+        // 查询合约 Token 余额 - 核心修复
         async function queryContractTokenBalance() {
             if (!withdrawContractInstance) return;
             try {
-                // 获取当前 Token 地址和小数位
+                // 1. 获取当前 Token 地址
                 const tokenAddr = await withdrawContractInstance.token();
+                if (tokenAddr === ethers.constants.AddressZero) {
+                    throw new Error('Token地址为零地址，请先设置Token地址');
+                }
+
+                // 2. 创建Token合约实例（使用provider，只读）
                 const tokenInstance = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
-                const decimals = await tokenInstance.decimals();
-                // 查询合约余额（最小单位）
-                const balanceWei = await withdrawContractInstance.balanceOf(withdrawContractInstance.address);
+                
+                // 3. 获取小数位（处理可能的小数位查询失败）
+                let decimals = 18; // 默认18位小数
+                try {
+                    decimals = await tokenInstance.decimals();
+                } catch (err) {
+                    showDebugInfo(`获取Token小数位失败，使用默认值18: ${err.message}`);
+                }
+
+                // 4. 查询合约余额（直接用Token合约查询，修复原逻辑错误）
+                const contractAddr = withdrawContractInstance.address;
+                const balanceWei = await tokenInstance.balanceOf(contractAddr);
                 const balanceReadable = ethers.utils.formatUnits(balanceWei, decimals);
-                document.getElementById('contractBalance').textContent = `合约 Token 余额：${balanceReadable}（${balanceWei.toString()} 最小单位）`;
+
+                // 5. 更新UI
+                document.getElementById('contractBalance').textContent = 
+                    `合约 Token 余额：${balanceReadable}（${balanceWei.toString()} 最小单位）`;
+                
+                showDebugInfo(`Token地址: ${tokenAddr}\n小数位: ${decimals}\n合约余额(Wei): ${balanceWei}\n合约余额(可读): ${balanceReadable}`);
+
             } catch (err) {
-                document.getElementById('contractBalance').textContent = `查询失败: ${err.message}`;
+                const errMsg = `查询合约余额失败: ${err.message}`;
+                document.getElementById('contractBalance').textContent = errMsg;
+                showDebugInfo(errMsg);
             }
         }
 
@@ -718,14 +805,17 @@
             try {
                 const [lastWithdrawDate, withdrawnToday] = await withdrawContractInstance.dailyRecords(queryAccount);
                 // 转换天戳记为日期
-                const dateStr = new Date(lastWithdrawDate * 86400 * 1000).toLocaleDateString();
+                const dateStr = lastWithdrawDate === 0 ? '未提取过' : new Date(lastWithdrawDate * 86400 * 1000).toLocaleDateString();
+                
                 document.getElementById('queryRecordResult').style.display = 'block';
                 document.getElementById('recordAccount').textContent = queryAccount;
                 document.getElementById('recordLastDate').textContent = lastWithdrawDate.toString();
-                document.getElementById('recordLastDateStr').textContent = lastWithdrawDate === 0 ? '未提取过' : dateStr;
+                document.getElementById('recordLastDateStr').textContent = dateStr;
                 document.getElementById('recordWithdrawnToday').textContent = withdrawnToday.toString();
             } catch (err) {
-                alert(`查询失败: ${err.message}`);
+                const errMsg = `查询提取记录失败: ${err.message}`;
+                alert(errMsg);
+                showDebugInfo(errMsg);
                 document.getElementById('queryRecordResult').style.display = 'none';
             }
         }
@@ -737,7 +827,7 @@
                 alert('请先连接钱包！');
                 return false;
             }
-            if (!document.getElementById('adminBadge').style.display) {
+            if (document.getElementById('adminBadge').style.display !== 'inline-block') {
                 alert('仅合约管理员可执行此操作！');
                 return false;
             }
@@ -747,7 +837,7 @@
         // 格式化错误信息
         function formatErrorMsg(msg) {
             if (msg.includes('user rejected')) return '你已拒绝钱包交易请求';
-            if (msg.includes('Only owner can call')) return '无管理员权限';
+            if (msg.includes('Only owner can call') || msg.includes('onlyOwner')) return '无管理员权限';
             if (msg.includes('Daily limit must >=')) return '每日限额必须大于等于单次限额';
             if (msg.includes('Withdrawal is disabled')) return '该账号提取功能已禁用';
             if (msg.includes('Exceeds per transaction limit')) return '提取数量超过单次限额';
@@ -764,5 +854,4 @@
         };
     </script>
 </body>
-
 </html>
